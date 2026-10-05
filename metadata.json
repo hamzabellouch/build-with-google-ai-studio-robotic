@@ -2,5 +2,7 @@
   "name": "Remix: Robotics Pick and Place",
   "description": "Simulated Franka Panda executing Pick and Place using Gemini Robotics ER.",
   "requestFramePermissions": [],
-  "majorCapabilities": []
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

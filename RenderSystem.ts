@@ -251,6 +251,19 @@ export class RenderSystem {
         return this.renderer.domElement.toDataURL(mimeType, mimeType === 'image/jpeg' ? 0.8 : undefined);
     }
 
+    project3DTo2D(point: THREE.Vector3, cameraPos: THREE.Vector3, lookAt: THREE.Vector3): { x: number; y: number } {
+        const virtCam = this.camera.clone();
+        virtCam.position.copy(cameraPos);
+        virtCam.lookAt(lookAt);
+        virtCam.updateMatrixWorld();
+        virtCam.updateProjectionMatrix();
+
+        const v = point.clone().project(virtCam);
+        const x = Math.max(0, Math.min(1000, Math.round(((v.x + 1) / 2) * 1000)));
+        const y = Math.max(0, Math.min(1000, Math.round(((-v.y + 1) / 2) * 1000)));
+        return { x, y };
+    }
+
     project2DTo3D(x: number, y: number, cameraPos: THREE.Vector3, lookAt: THREE.Vector3): { point: THREE.Vector3, bodyId: number } | null {
         const virtCam = this.camera.clone();
         virtCam.position.copy(cameraPos);

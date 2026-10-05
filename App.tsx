@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import { GoogleGenAI } from "@google/genai";
 import { AlertCircle, Loader2, X } from 'lucide-react';
 import loadMujoco from 'mujoco_wasm';
 import { useEffect, useRef, useState } from 'react';
@@ -13,6 +12,10 @@ import { MujocoSim } from './MujocoSim';
 import { RobotSelector } from './components/RobotSelector';
 import { Toolbar } from './components/Toolbar';
 import { UnifiedSidebar } from './components/UnifiedSidebar';
+import { ArrangementsModal } from './components/ArrangementsModal';
+import { RobotSelectionModal } from './components/RobotSelectionModal';
+import { CubeArrangement } from './cubeArrangements';
+import { FAMOUS_ROBOTS, RobotModelDef } from './robotModels';
 import { DetectedItem, DetectType, LogEntry, MujocoModule } from './types';
 
 /**
@@ -102,6 +105,11 @@ export function App() {
   
   const [isPickingUp, setIsPickingUp] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [isArrangementsOpen, setIsArrangementsOpen] = useState(false);
+  const [currentArrangementId, setCurrentArrangementId] = useState<string | null>(null);
+  const [selectedRobot, setSelectedRobot] = useState<RobotModelDef>(() => FAMOUS_ROBOTS[0]);
+  const [isRobotModalOpen, setIsRobotModalOpen] = useState(false);
+  const [isSwitchingRobot, setIsSwitchingRobot] = useState(false);
 
   const [gizmoStats, setGizmoStats] = useState<{pos: string, rot: string} | null>(null);
 
@@ -143,7 +151,7 @@ export function App() {
           simRef.current = new MujocoSim(containerRef.current, mujocoModuleRef.current);
           simRef.current.renderSys.setDarkMode(isDarkMode);
           
-          simRef.current.init("franka_panda_stack", "scene.xml", (msg) => {
+          simRef.current.init(selectedRobot.id, selectedRobot.sceneFile, (msg) => {
              if (isMounted.current) setLoadingStatus(msg);
           })
              .then(() => {
@@ -221,7 +229,7 @@ export function App() {
     return () => window.removeEventListener('click', handleClick);
   }, [isLoading, erLoading]);
 
-  const handleErSend = async (prompt: string, type: DetectType, temperature: number, enableThinking: boolean, modelId: string) => {
+  const handleErSend = async (prompt: string, type: DetectType) => {
       if (!simRef.current || erLoading) return;
       setErLoading(true);
       simRef.current.renderSys.clearErMarkers();
@@ -233,131 +241,67 @@ export function App() {
       const savedState = simRef.current.renderSys.getCameraState();
       const topPos = new THREE.Vector3(0, -0.01, 2.0); 
       const target = new THREE.Vector3(0, 0, 0);
-      await simRef.current.renderSys.moveCameraTo(topPos, target, 1500);
+      await simRef.current.renderSys.moveCameraTo(topPos, target, 1200);
       await new Promise(r => setTimeout(r, 100)); 
 
       setFlash(true);
       setTimeout(() => setFlash(false), 100);
       
-      // Dynamic Resizing: Limit max dimension to 640px while preserving aspect ratio.
       const canvas = simRef.current.renderSys.renderer.domElement;
       const width = canvas.width;
       const height = canvas.height;
       const scaleFactor = Math.min(640 / width, 640 / height);
       const snapshotWidth = Math.floor(width * scaleFactor);
       const snapshotHeight = Math.floor(height * scaleFactor);
-      
-      // Serialization: Convert to PNG.
       const imageBase64 = simRef.current.renderSys.getCanvasSnapshot(snapshotWidth, snapshotHeight, 'image/png');
-      // Payload Preparation: Strip data URI prefix.
-      const base64Data = imageBase64.replace('data:image/png;base64,', '');
 
       const parts = defaultPromptParts[type];
       const subject = prompt.trim() || parts[1];
-      const textPrompt = `${parts[0]} ${subject}${parts[2]}`;
-      
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const config: any = {
-          temperature,
-          responseMimeType: "application/json",
-      };
-
-      if (!enableThinking) {
-          config.thinkingConfig = { thinkingBudget: 0 };
-      }
-
-      const requestLogData = {
-          model: modelId,
-          contents: {
-              parts: [
-                  { inlineData: { data: "<IMAGE>", mimeType: "image/png" } },
-                  { text: textPrompt }
-              ]
-          },
-          config: config
-      };
+      const textPrompt = `[Spatial Perception Algorithm] Filter: ${subject}`;
 
       const logId = uuidv4();
       const newLog: LogEntry = {
           id: logId,
           timestamp: new Date(),
           imageSrc: imageBase64,
-          prompt,
+          prompt: subject,
           fullPrompt: textPrompt,
           type,
           result: null, 
-          requestData: requestLogData
+          requestData: {
+              algorithm: 'Pure Simulation Geometry & Coordinate Solver',
+              filter: subject,
+              type: type,
+              status: 'Computing coordinates...'
+          }
       };
       setLogs(prev => [newLog, ...prev]);
 
-      await simRef.current.renderSys.moveCameraTo(savedState.position, savedState.target, 1500);
+      await simRef.current.renderSys.moveCameraTo(savedState.position, savedState.target, 1200);
 
       try {
-          const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-          const response = await ai.models.generateContent({
-              model: modelId,
-              contents: {
-                  parts: [
-                      { inlineData: { mimeType: 'image/png', data: base64Data } },
-                      { text: textPrompt }
-                  ]
-              },
-              // tslint:disable-next-line:no-any
-              config: config
+          const detected = simRef.current.detectCubesAlgorithmically(prompt, type, topPos, target);
+          const result = detected.map(d => type === 'Points' ? { point: d.point, label: d.label } : { box_2d: d.box_2d, label: d.label });
+
+          setLogs(prev => prev.map(l => l.id === logId ? { 
+              ...l, 
+              result, 
+              requestData: { 
+                  algorithm: 'Analytical IK & Geometric Perception (100% Offline)', 
+                  cubesFound: detected.length,
+                  status: 'Calculated instantly with zero API dependencies' 
+              } 
+          } : l));
+
+          detected.forEach(d => {
+              const markerId = Date.now() + Math.random();
+              simRef.current?.renderSys.addErMarker(d.worldPos, d.label, markerId);
+              detectedTargets.current.push({ pos: d.worldPos, markerId });
           });
-
-          const text = response.text;
-          if (!text) throw new Error("No response text returned.");
-
-          let jsonText = text.replace(/```json|```/g, '').trim();
-          const firstBracket = jsonText.indexOf('[');
-          const lastBracket = jsonText.lastIndexOf(']');
-          if (firstBracket !== -1 && lastBracket !== -1) {
-              jsonText = jsonText.substring(firstBracket, lastBracket + 1);
-          }
-
-          let result;
-          try { result = JSON.parse(jsonText); } catch (e) { result = []; }
-
-          // Remove absolute duplicates
-          if (Array.isArray(result)) {
-              const seen = new Set();
-              result = result.filter((item: unknown) => {
-                  const serialized = JSON.stringify(item);
-                  if (seen.has(serialized)) return false;
-                  seen.add(serialized);
-                  return true;
-              });
-          }
-
-          setLogs(prev => prev.map(l => l.id === logId ? { ...l, result } : l));
-
-          if (Array.isArray(result)) {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              result.forEach((item: any) => {
-                  let center2d: {x: number, y: number} | null = null;
-                  if (item.box_2d) {
-                      const [ymin, xmin, ymax, xmax] = item.box_2d; 
-                      center2d = { x: (xmin + xmax) / 2, y: (ymin + ymax) / 2 };
-                  } else if (item.point) {
-                      const [y, x] = item.point;
-                      center2d = { x, y };
-                  }
-
-                  if (center2d) {
-                      const projection = simRef.current?.renderSys.project2DTo3D(center2d.x, center2d.y, topPos, target);
-                      if (projection) {
-                          const markerId = Date.now() + Math.random();
-                          simRef.current?.renderSys.addErMarker(projection.point, item.label, markerId);
-                          detectedTargets.current.push({ pos: projection.point, markerId });
-                      }
-                  }
-              });
-              setDetectedCount(detectedTargets.current.length);
-          }
-      } catch (error: unknown) {
-          console.error("Gemini API Error", error);
-          const errorMsg = (error as Error).message || "Unknown error";
+          setDetectedCount(detectedTargets.current.length);
+      } catch (err: unknown) {
+          console.error("Algorithm Error", err);
+          const errorMsg = (err as Error).message || "Algorithm error";
           setLogs(prev => prev.map(l => l.id === logId && l.result === null ? { ...l, result: { error: errorMsg } } : l));
       } finally {
           setErLoading(false);
@@ -399,13 +343,174 @@ export function App() {
     }
   };
 
+  const handleAutonomousRun = () => {
+    if (!simRef.current || erLoading) return;
+
+    // If already in motion, cycle speed
+    if (isPickingUp) {
+        let nextSpeed = 1;
+        if (playbackSpeed === 1) nextSpeed = 2;
+        else if (playbackSpeed === 2) nextSpeed = 5;
+        else if (playbackSpeed === 5) nextSpeed = 10;
+        else if (playbackSpeed === 10) nextSpeed = 20;
+        else if (playbackSpeed === 20) nextSpeed = 2;
+
+        setPlaybackSpeed(nextSpeed);
+        simRef.current.setSpeedMultiplier(nextSpeed);
+        return;
+    }
+
+    simRef.current.renderSys.clearErMarkers();
+    detectedTargets.current = [];
+    setDetectedCount(0);
+
+    const topPos = new THREE.Vector3(0, -0.01, 2.0);
+    const target = new THREE.Vector3(0, 0, 0);
+    const items = simRef.current.detectCubesAlgorithmically('', 'Points', topPos, target);
+
+    if (items.length === 0) {
+        return;
+    }
+
+    items.forEach(it => {
+        const markerId = Date.now() + Math.random();
+        simRef.current?.renderSys.addErMarker(it.worldPos, it.label, markerId);
+        detectedTargets.current.push({ pos: it.worldPos, markerId });
+    });
+    setDetectedCount(items.length);
+
+    const snapshot = simRef.current.renderSys.getCanvasSnapshot(400, 300, 'image/png');
+    const newLog: LogEntry = {
+        id: uuidv4(),
+        timestamp: new Date(),
+        imageSrc: snapshot,
+        prompt: 'All cubes (Autonomous Run)',
+        fullPrompt: '[Pure Algorithmic Pick & Place] Analytical Inverse Kinematics + MuJoCo Rigid Body Physics (100% Offline)',
+        type: 'Points',
+        result: items.map(it => ({ point: it.point, label: it.label })),
+        requestData: { 
+            mode: 'Autonomous Algorithmic Mode',
+            cubesFound: items.length,
+            status: 'Analytical IK Solved - Grasping & Stacking'
+        }
+    };
+    setLogs(prev => [newLog, ...prev]);
+
+    setIsPickingUp(true);
+    setPlaybackSpeed(2);
+    simRef.current.setSpeedMultiplier(2);
+
+    const positions = detectedTargets.current.map(t => t.pos);
+    const markerIds = detectedTargets.current.map(t => t.markerId);
+
+    simRef.current.pickupItems(positions, markerIds, () => {
+        setIsPickingUp(false);
+        setPlaybackSpeed(1);
+        setDetectedCount(0);
+        detectedTargets.current = [];
+        simRef.current?.setSpeedMultiplier(1);
+    });
+  };
+
+  const handleSelectArrangement = (arrangement: CubeArrangement) => {
+    if (!simRef.current) return;
+    setCurrentArrangementId(arrangement.id);
+    setIsPickingUp(false);
+    setPlaybackSpeed(1);
+    setDetectedCount(0);
+    detectedTargets.current = [];
+
+    const positions = arrangement.getPositions();
+    simRef.current.applyCubeArrangement(positions);
+
+    // Capture visual snapshot for history
+    const snapshot = simRef.current.renderSys.getCanvasSnapshot(400, 300, 'image/png');
+    const newLog: LogEntry = {
+        id: uuidv4(),
+        timestamp: new Date(),
+        imageSrc: snapshot,
+        prompt: `#${arrangement.index}: ${arrangement.name}`,
+        fullPrompt: `[Workcell Formation #${arrangement.index}] ${arrangement.category} - ${arrangement.description}`,
+        type: 'Points',
+        result: positions.map((p, idx) => ({
+            point: [Math.round(500 - p.y * 300), Math.round(500 - p.x * 300)] as [number, number],
+            label: `${['red', 'cyan', 'green', 'yellow'][idx % 4]} cube`
+        })),
+        requestData: { 
+            formation: arrangement.name,
+            category: arrangement.category,
+            index: arrangement.index,
+            cubesPositioned: positions.length,
+            status: 'Procedural arrangement applied to MuJoCo physics engine'
+        }
+    };
+    setLogs(prev => [newLog, ...prev]);
+  };
+
   const handleReset = () => {
     simRef.current?.reset();
+    setCurrentArrangementId(null);
     setLogs([]);
     setDetectedCount(0);
     setIsPickingUp(false);
     setPlaybackSpeed(1);
     detectedTargets.current = [];
+  };
+
+  const handleSelectRobot = async (robot: RobotModelDef) => {
+    if (robot.id === selectedRobot.id || !simRef.current || !mujocoModuleRef.current) {
+      setIsRobotModalOpen(false);
+      return;
+    }
+
+    setIsSwitchingRobot(true);
+    setSelectedRobot(robot);
+    setIsRobotModalOpen(false);
+    setIsPickingUp(false);
+    setPlaybackSpeed(1);
+    setDetectedCount(0);
+    detectedTargets.current = [];
+
+    setIsLoading(true);
+    setLoadingStatus(`Loading ${robot.name}...`);
+
+    try {
+      await simRef.current.init(robot.id, robot.sceneFile, (msg) => {
+        if (isMounted.current) setLoadingStatus(msg);
+      });
+      if (isMounted.current) {
+        simRef.current.setIkEnabled(false);
+        setIsLoading(false);
+      }
+
+      const snapshot = simRef.current.renderSys.getCanvasSnapshot(400, 300, 'image/png');
+      const newLog: LogEntry = {
+        id: uuidv4(),
+        timestamp: new Date(),
+        imageSrc: snapshot,
+        prompt: `Active Robot: ${robot.name}`,
+        fullPrompt: `[Workcell Reconfiguration] Deployed ${robot.name} (${robot.dof}-DOF ${robot.type}) by ${robot.manufacturer}. Payload: ${robot.payload}, Reach: ${robot.reach}, Precision: ${robot.repeatability}.`,
+        type: 'Points',
+        result: [],
+        requestData: {
+          robot: robot.name,
+          dof: robot.dof,
+          manufacturer: robot.manufacturer,
+          payload: robot.payload,
+          reach: robot.reach,
+          status: 'Kinematics & physics reconfigured'
+        }
+      };
+      setLogs(prev => [newLog, ...prev]);
+    } catch (err) {
+      console.error("Failed to switch robot:", err);
+      if (isMounted.current) {
+        setLoadError((err as Error).message || "Failed to switch robot");
+        setIsLoading(false);
+      }
+    } finally {
+      if (isMounted.current) setIsSwitchingRobot(false);
+    }
   };
 
   return (
@@ -414,7 +519,16 @@ export function App() {
       <div ref={containerRef} className="w-full h-full absolute inset-0 bg-slate-200" />
       
       {/* Robot Info Overlay */}
-      {!loadError && <RobotSelector gizmoStats={gizmoStats} isDarkMode={isDarkMode} />}
+      {!loadError && (
+        <RobotSelector 
+          gizmoStats={gizmoStats} 
+          isDarkMode={isDarkMode} 
+          robotName={selectedRobot.name}
+          robotDof={selectedRobot.dof}
+          robotType={selectedRobot.type}
+          onOpenRobotModal={() => setIsRobotModalOpen(true)}
+        />
+      )}
       
       {/* Loading Screen */}
       {isLoading && (
@@ -423,12 +537,12 @@ export function App() {
                   <div className={`glass-panel p-12 rounded-[3rem] flex-1 flex flex-col justify-center shadow-2xl transition-colors ${isDarkMode ? 'bg-slate-900/70 border-white/10' : 'bg-white/70 border-white/80'}`}>
                     <h3 className={`text-sm font-bold uppercase tracking-widest mb-4 ${isDarkMode ? 'text-indigo-400' : 'text-indigo-600'}`}>System Overview</h3>
                     <p className={`text-sm leading-relaxed mb-6 ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>
-                      This demo showcases spatial reasoning for robotics. Using <strong>Gemini Robotics Embodied Reasoning 1.6</strong>, the system analyzes a 2D image to identify objects and calculate manipulation coordinates.
+                      Advanced robotic arm simulation and manipulation. The system operates entirely on <strong>Analytical Inverse Kinematics (IK)</strong> and the <strong>MuJoCo C++/WASM</strong> rigid-body physics engine, running 100% locally and offline without external API calls.
                     </p>
                     <ul className={`text-[13px] space-y-3 list-disc list-inside ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-                        <li>Real-time MuJoCo physics simulation</li>
-                        <li>Analytical Inverse Kinematics for Franka Panda</li>
-                        <li>Call Gemini Robotics Embodied Reasoning 1.6 for detection</li>
+                        <li>Real-time MuJoCo physics simulation in WebAssembly</li>
+                        <li>Analytical 7-DOF Inverse Kinematics solver</li>
+                        <li>Autonomous algorithmic spatial perception and trajectory planning</li>
                     </ul>
                   </div>
 
@@ -471,10 +585,15 @@ export function App() {
             isPaused={isPaused} 
             togglePause={() => setIsPaused(simRef.current?.togglePause() ?? false)} 
             onReset={handleReset} 
+            onOpenArrangements={() => setIsArrangementsOpen(true)}
+            onOpenRobotModal={() => setIsRobotModalOpen(true)}
             showSidebar={showSidebar}
             toggleSidebar={() => setShowSidebar(!showSidebar)}
             isDarkMode={isDarkMode}
             toggleDarkMode={toggleDarkMode}
+            onAutonomousRun={handleAutonomousRun}
+            isPickingUp={isPickingUp}
+            playbackSpeed={playbackSpeed}
           />
           
           <UnifiedSidebar 
@@ -491,13 +610,33 @@ export function App() {
             playbackSpeed={playbackSpeed}
           />
 
+          {/* 108 Cube Arrangements & Formations Catalog Modal */}
+          <ArrangementsModal 
+            isOpen={isArrangementsOpen}
+            onClose={() => setIsArrangementsOpen(false)}
+            onSelectArrangement={handleSelectArrangement}
+            onResetDefault={handleReset}
+            currentArrangementId={currentArrangementId}
+            isDarkMode={isDarkMode}
+          />
+
+          {/* 10 Famous Robots Selection Modal */}
+          <RobotSelectionModal 
+            isOpen={isRobotModalOpen}
+            onClose={() => setIsRobotModalOpen(false)}
+            onSelectRobot={handleSelectRobot}
+            currentRobotId={selectedRobot.id}
+            isDarkMode={isDarkMode}
+            isSwitching={isSwitchingRobot}
+          />
+
           {/* Expanded View Modal - Overlay everything */}
           {activeLog && (
             <div className="fixed inset-0 z-[100] flex items-center justify-center min-[660px]:p-10 bg-slate-950/20 backdrop-blur-xl animate-in fade-in" onClick={() => setExpandedLogId(null)}>
               <div className={`glass-panel overflow-hidden flex flex-col shadow-2xl transition-colors fixed top-4 bottom-4 left-4 right-4 rounded-[2.5rem] min-[660px]:relative min-[660px]:inset-auto min-[660px]:w-full min-[660px]:max-w-4xl min-[660px]:max-h-[85vh] ${isDarkMode ? 'bg-slate-900 border-white/10 text-slate-100' : 'bg-white border-white/80 text-slate-800'}`} onClick={e => e.stopPropagation()}>
                  <div className={`p-6 border-b flex justify-between items-center shrink-0 ${isDarkMode ? 'border-white/5 bg-white/5' : 'border-slate-100 bg-white/40'}`}>
                     <div>
-                      <h3 className="text-xl font-bold">API Call</h3>
+                      <h3 className="text-xl font-bold">Algorithm Execution</h3>
                       <p className={`text-xs font-medium ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{activeLog.timestamp.toLocaleString()}</p>
                     </div>
                     <button onClick={() => setExpandedLogId(null)} className={`w-10 h-10 flex items-center justify-center rounded-full shadow-sm border transition-colors ${isDarkMode ? 'bg-slate-800 border-white/10 text-slate-400 hover:text-slate-200' : 'bg-white border-slate-100 text-slate-400 hover:text-slate-600'}`}>
@@ -513,15 +652,15 @@ export function App() {
                     </div>
                     <div className={`min-[660px]:w-[320px] p-6 flex flex-col gap-5 min-[660px]:overflow-y-auto min-[660px]:custom-scrollbar ${isDarkMode ? 'bg-white/5' : 'bg-white/20'}`}>
                        <div className="space-y-1">
-                          <h4 className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">User Prompt</h4>
+                          <h4 className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Target Filter</h4>
                           <p className="text-sm font-bold leading-tight">{activeLog.prompt}</p>
                        </div>
                        <div className="space-y-1">
-                          <h4 className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Full Prompt</h4>
+                          <h4 className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Computational Pipeline</h4>
                           <p className={`text-[10px] font-mono p-3 rounded-xl leading-relaxed border whitespace-pre-wrap ${isDarkMode ? 'bg-slate-950 border-white/5 text-slate-400' : 'bg-slate-50 border-slate-200/50 text-slate-500'}`}>{activeLog.fullPrompt}</p>
                        </div>
                        <div className="space-y-3 flex flex-col min-[660px]:flex-1 min-[660px]:min-h-0">
-                          <h4 className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">API Call Results</h4>
+                          <h4 className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Geometric Results</h4>
                           <div className={`p-3 rounded-xl font-mono text-[10px] border overflow-y-auto shadow-inner min-[660px]:flex-1 max-[659px]:h-96 ${isDarkMode ? 'bg-slate-950 border-white/5 text-indigo-400' : 'bg-slate-50/50 border-slate-100 text-indigo-600'}`}>
                             {activeLog.result === null ? (
                                 <div className="h-full flex flex-col items-center justify-center gap-3 text-indigo-400 animate-pulse">

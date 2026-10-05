@@ -152,13 +152,21 @@ export class IkSystem {
         }
     }
     
+    getGizmo(): THREE.Object3D {
+        if ('getHelper' in this.control && typeof (this.control as any).getHelper === 'function') {
+            return (this.control as any).getHelper();
+        }
+        return this.control as unknown as THREE.Object3D;
+    }
+    
     setCalculating(enabled: boolean) {
         this.calculating = enabled;
     }
     
     setGizmoVisible(visible: boolean) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (this.control as any).visible = this.control.enabled = visible;
+        this.control.enabled = visible;
+        const gizmo = this.getGizmo();
+        gizmo.visible = visible;
     }
     
     setTargetVisible(visible: boolean) {
@@ -174,6 +182,11 @@ export class IkSystem {
     }
     
     dispose() {
-        this.control.dispose();
+        try {
+            this.control.detach();
+            this.control.dispose();
+        } catch (e) {
+            /* ignore */
+        }
     }
 }

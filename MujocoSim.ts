@@ -34,6 +34,7 @@ export class MujocoSim {
     paused = false;
     gripperActuatorId = -1;
     speedMultiplier = 1;
+    currentRobotId = 'franka_emika_panda';
     
     private userIkEnabled = false; 
     private firstIkEnable = true; // Track first enable to enforce default rotation
@@ -60,7 +61,7 @@ export class MujocoSim {
         
         this.ikSys = new IkSystem(this.mujoco, this.renderSys.camera, this.renderSys.renderer.domElement, this.renderSys.controls);
         this.renderSys.simGroup.add(this.ikSys.target); 
-        this.renderSys.scene.add(this.ikSys.control as unknown as THREE.Object3D);
+        this.renderSys.scene.add(this.ikSys.getGizmo());
         
         this.sequenceAnimator = new SequenceAnimator();
         
@@ -68,6 +69,7 @@ export class MujocoSim {
     }
 
     async init(robotId = 'franka_emika_panda', sceneFile = 'scene.xml', onProgress?: (msg: string) => void) {
+        this.currentRobotId = robotId;
         const loader = new RobotLoader(this.mujoco);
         const { isDouble, isStacking } = await loader.load(robotId, sceneFile, onProgress);
 
@@ -82,10 +84,15 @@ export class MujocoSim {
             this.ikSys.gripperSiteId = -1; 
             this.gripperActuatorId = -1;
             for (let i = 0; i < this.mjModel.nsite; i++) {
-                 if (getName(this.mjModel, this.mjModel.name_siteadr[i]).includes('tcp')) { 
+                 const siteName = getName(this.mjModel, this.mjModel.name_siteadr[i]).toLowerCase();
+                 if (siteName.includes('tcp') || siteName.includes('attachment') || siteName.includes('pinch') || siteName.includes('grip')) { 
                      this.ikSys.gripperSiteId = i; break; 
                  }
             }
+            if (this.ikSys.gripperSiteId === -1 && this.mjModel.nsite > 0) {
+                 this.ikSys.gripperSiteId = this.mjModel.nsite - 1;
+            }
+
             for (let i = 0; i < this.mjModel.nu; i++) {
                  if (getName(this.mjModel, this.mjModel.name_actuatoradr[i]).includes('gripper')) { 
                      this.gripperActuatorId = i; break; 
@@ -113,7 +120,28 @@ export class MujocoSim {
     
     private setInitialPose() {
         if (!this.mjModel || !this.mjData) return;
-        const initVals = [1.707, -1.754, 0.003, -2.702, 0.003, 0.951, 2.490, 0.000];
+        
+        let initVals: number[] = [];
+        if (this.currentRobotId.includes('scara')) {
+            initVals = [0.4, -0.8, -0.05, 0.4, 0.0];
+        } else if (this.currentRobotId.includes('ur5e')) {
+            initVals = [0, -1.57, 1.57, -1.57, -1.57, 0];
+        } else if (this.currentRobotId.includes('kuka') || this.currentRobotId.includes('iiwa')) {
+            initVals = [0, 0.4, 0, -1.2, 0, 1.2, 0];
+        } else if (this.currentRobotId.includes('kinova') || this.currentRobotId.includes('gen3')) {
+            initVals = [0, 0.35, 0, -2.1, 0, 1.0, 1.57];
+        } else if (this.currentRobotId.includes('sawyer')) {
+            initVals = [0, -0.8, 0, 1.5, 0, 0.7, 0];
+        } else if (this.currentRobotId.includes('xarm7')) {
+            initVals = [0, 0.3, 0, 1.2, 0, 0.8, 0];
+        } else if (this.currentRobotId.includes('lite6')) {
+            initVals = [0, 0.3, 0.9, 0, 0.8, 0];
+        } else if (this.currentRobotId.includes('piper')) {
+            initVals = [0, 0.5, 0.5, 0, 0.5, 0];
+        } else {
+            // Franka Panda & FR3 default
+            initVals = [1.707, -1.754, 0.003, -2.702, 0.003, 0.951, 2.490, 0.000];
+        }
         
         for (let i = 0; i < Math.min(initVals.length, this.mjModel.nu); i++) {
             this.mjData.ctrl[i] = initVals[i];
@@ -300,6 +328,112 @@ export class MujocoSim {
         }
     }
 
+    /**
+     * Pure geometric & state-based algorithmic cube detector.
+     * Evaluates all cubes on the table without any external API calls.
+     */
+    detectCubesAlgorithmically(
+        colorFilter: string | undefined,
+        detectType: '2D bounding boxes' | 'Points',
+        cameraPos: THREE.Vector3,
+        lookAt: THREE.Vector3
+    ): Array<{
+        point?: [number, number];
+        box_2d?: [number, number, number, number];
+        label: string;
+        worldPos: THREE.Vector3;
+        bodyId: number;
+    }> {
+        if (!this.mjModel || !this.mjData) return [];
+        const result: Array<{
+            point?: [number, number];
+            box_2d?: [number, number, number, number];
+            label: string;
+            worldPos: THREE.Vector3;
+            bodyId: number;
+        }> = [];
+
+        const colorMap = ['red', 'cyan', 'green', 'yellow'];
+        const filter = (colorFilter || '').toLowerCase().trim();
+
+        for (let i = 0; i < this.mjModel.nbody; i++) {
+            const name = getName(this.mjModel, this.mjModel.name_bodyadr[i]);
+            if (name.startsWith('cube')) {
+                const cubeIndex = parseInt(name.replace('cube', ''), 10);
+                const colorName = !isNaN(cubeIndex) ? colorMap[cubeIndex % 4] : 'cube';
+
+                const pos = new THREE.Vector3(
+                    this.mjData.xpos[i * 3],
+                    this.mjData.xpos[i * 3 + 1],
+                    this.mjData.xpos[i * 3 + 2]
+                );
+
+                // Exclude cubes already in stack tray area (x ~ 0.6, y ~ 0)
+                const distToTray = Math.hypot(pos.x - 0.6, pos.y);
+                if (distToTray < 0.2 && pos.z > 0.04) {
+                    continue;
+                }
+
+                // Check color match if prompt is specific (e.g. "red", "green", "cyan", "yellow")
+                if (filter && !filter.includes('all') && !filter.includes('cube') && !filter.includes('item') && !filter.includes('point') && !filter.includes('box')) {
+                    if (!filter.includes(colorName)) {
+                        continue;
+                    }
+                }
+
+                const center2d = this.renderSys.project3DTo2D(pos, cameraPos, lookAt);
+
+                if (detectType === 'Points') {
+                    result.push({
+                        point: [center2d.y, center2d.x],
+                        label: `${colorName} cube`,
+                        worldPos: pos,
+                        bodyId: i,
+                    });
+                } else {
+                    // Calculate 2D bounding box from cube half-size (0.02)
+                    const r = 0.025;
+                    const corners = [
+                        new THREE.Vector3(pos.x - r, pos.y - r, pos.z - r),
+                        new THREE.Vector3(pos.x + r, pos.y - r, pos.z - r),
+                        new THREE.Vector3(pos.x - r, pos.y + r, pos.z - r),
+                        new THREE.Vector3(pos.x + r, pos.y + r, pos.z - r),
+                        new THREE.Vector3(pos.x - r, pos.y - r, pos.z + r),
+                        new THREE.Vector3(pos.x + r, pos.y - r, pos.z + r),
+                        new THREE.Vector3(pos.x - r, pos.y + r, pos.z + r),
+                        new THREE.Vector3(pos.x + r, pos.y + r, pos.z + r),
+                    ];
+
+                    let minX = 1000, maxX = 0, minY = 1000, maxY = 0;
+                    for (const c of corners) {
+                        const pt = this.renderSys.project3DTo2D(c, cameraPos, lookAt);
+                        if (pt.x < minX) minX = pt.x;
+                        if (pt.x > maxX) maxX = pt.x;
+                        if (pt.y < minY) minY = pt.y;
+                        if (pt.y > maxY) maxY = pt.y;
+                    }
+
+                    if (maxX - minX < 14) { minX -= 7; maxX += 7; }
+                    if (maxY - minY < 14) { minY -= 7; maxY += 7; }
+
+                    result.push({
+                        box_2d: [
+                            Math.max(0, minY),
+                            Math.max(0, minX),
+                            Math.min(1000, maxY),
+                            Math.min(1000, maxX),
+                        ],
+                        label: `${colorName} cube`,
+                        worldPos: pos,
+                        bodyId: i,
+                    });
+                }
+            }
+        }
+
+        return result;
+    }
+
     reset() {
         if (!this.mjModel || !this.mjData) return;
         this.renderSys.clearErMarkers();
@@ -311,6 +445,52 @@ export class MujocoSim {
         this.mujoco.mj_forward(this.mjModel, this.mjData); 
         this.ikSys.syncToSite(this.mjData);
         
+        this.ikSys.target.quaternion.setFromEuler(new THREE.Euler(Math.PI, 0, 0));
+        this.ikSys.target.position.set(0, 0, 0.45);
+        this.firstIkEnable = true;
+    }
+
+    applyCubeArrangement(positions: Array<{ x: number; y: number }>) {
+        if (!this.mjModel || !this.mjData) return;
+        this.renderSys.clearErMarkers();
+        this.gizmoAnim.active = false;
+        this.sequenceAnimator.reset();
+        this.mujoco.mj_resetData(this.mjModel, this.mjData);
+        this.setInitialPose();
+
+        let cubeIdx = 0;
+        for (let i = 0; i < this.mjModel.nbody; i++) {
+            const name = getName(this.mjModel, this.mjModel.name_bodyadr[i]);
+            if (name.startsWith('cube')) {
+                if (cubeIdx < positions.length) {
+                    const { x, y } = positions[cubeIdx];
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const jntIdVal = (this.mjModel as any).body_jntadr[i];
+                    if (jntIdVal >= 0) {
+                        const qp = this.mjModel.jnt_qposadr[jntIdVal];
+                        this.mjData.qpos[qp] = x;
+                        this.mjData.qpos[qp + 1] = y;
+                        this.mjData.qpos[qp + 2] = 0.02;
+                        // Identity upright rotation
+                        this.mjData.qpos[qp + 3] = 1;
+                        this.mjData.qpos[qp + 4] = 0;
+                        this.mjData.qpos[qp + 5] = 0;
+                        this.mjData.qpos[qp + 6] = 0;
+
+                        const dofAdr = this.mjModel.jnt_dofadr[jntIdVal];
+                        for (let k = 0; k < 6; k++) {
+                            this.mjData.qvel[dofAdr + k] = 0;
+                            this.mjData.qacc[dofAdr + k] = 0;
+                        }
+                    }
+                    cubeIdx++;
+                }
+            }
+        }
+
+        this.mujoco.mj_forward(this.mjModel, this.mjData);
+        this.ikSys.syncToSite(this.mjData);
+
         this.ikSys.target.quaternion.setFromEuler(new THREE.Euler(Math.PI, 0, 0));
         this.ikSys.target.position.set(0, 0, 0.45);
         this.firstIkEnable = true;
